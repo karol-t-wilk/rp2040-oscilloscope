@@ -3,12 +3,11 @@
 
 use bsp::{
     entry,
-    hal::{self, Adc, Clock},
+    hal::{self, Adc},
 };
 use defmt::*;
 use defmt_rtt as _;
 use embedded_hal::prelude::_embedded_hal_adc_OneShot;
-use heapless::String;
 use panic_probe as _;
 
 // Provide an alias for our BSP so we can switch targets quickly.
@@ -16,16 +15,14 @@ use panic_probe as _;
 use rp_pico as bsp;
 // use sparkfun_pro_micro_rp2040 as bsp;
 
-use bsp::hal::{clocks::init_clocks_and_plls, pac, sio::Sio, watchdog::Watchdog};
+use bsp::hal::{clocks::init_clocks_and_plls, pac, watchdog::Watchdog};
 use usb_device::{
     class_prelude::{InterfaceNumber, UsbBus, UsbBusAllocator, UsbClass},
-    endpoint::{Endpoint, EndpointDirection, EndpointIn, In, Out},
+    endpoint::EndpointIn,
     prelude::{UsbDeviceBuilder, UsbVidPid},
-    UsbDirection, UsbError,
+    UsbError,
 };
 use usbd_serial::SerialPort;
-
-use core::fmt::Write;
 
 const BATCH_SIZE: usize = 32;
 
@@ -63,7 +60,6 @@ impl<'a, B: UsbBus> UsbClass<B> for BulkClass<'a, B> {
 fn main() -> ! {
     info!("Program start");
     let mut pac = pac::Peripherals::take().unwrap();
-    let mut adc = pac.ADC;
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
 
     // External high-speed crystal on the pico board is 12Mhz
@@ -111,12 +107,9 @@ fn main() -> ! {
         .serial_number("TEST")
         .build();
 
-    unsafe {
-        adc.fcs.write_with_zero(|w| w.en().set_bit());
-        adc.cs.write_with_zero(|w| w.start_many().set_bit());
-    }
+    let mut adc = Adc::new(pac.ADC, &mut pac.RESETS);
 
-    let gpio26 = pins.gpio26.into_floating_input();
+    let mut gpio26 = pins.gpio26.into_floating_input();
 
     loop {
         usb_dev.poll(&mut [&mut bulk, &mut serial]);
@@ -124,8 +117,7 @@ fn main() -> ! {
         let mut measures = [0 as u8; BATCH_SIZE * 2];
 
         for i in 0..BATCH_SIZE {
-            while adc.fcs.read().empty().bit() {}
-            let counts: u16 = adc.fifo.read().val().bits();
+            let counts: u16 = adc.read(&mut gpio26).unwrap_or(0);
             let first_byte_index = i * 2;
             let second_byte_index = first_byte_index + 1;
 
