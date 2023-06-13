@@ -64,6 +64,7 @@ fn main() -> ! {
     info!("Program start");
     let mut pac = pac::Peripherals::take().unwrap();
     let mut adc = pac.ADC;
+    let mut resets = pac.RESETS;
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
 
     // External high-speed crystal on the pico board is 12Mhz
@@ -74,26 +75,20 @@ fn main() -> ! {
         pac.CLOCKS,
         pac.PLL_SYS,
         pac.PLL_USB,
-        &mut pac.RESETS,
+        &mut resets,
         &mut watchdog,
     )
     .ok()
     .unwrap();
 
     let sio = hal::Sio::new(pac.SIO);
-    let pins = rp_pico::Pins::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut pac.RESETS,
-    );
 
     let usb_bus = hal::usb::UsbBus::new(
         pac.USBCTRL_REGS,
         pac.USBCTRL_DPRAM,
         clocks.usb_clock,
         true,
-        &mut pac.RESETS,
+        &mut resets,
     );
 
     // Set up the USB driver
@@ -112,30 +107,36 @@ fn main() -> ! {
         .build();
 
     unsafe {
+        resets.reset.modify(|r, w| w.bits(r.bits()).adc().set_bit());
+        resets.reset.modify(|r, w| w.bits(r.bits()).adc().clear_bit());
+        adc.cs.write_with_zero(|w| w.en().set_bit());
+        while !adc.cs.read().ready().bit() {}
+        pac.PADS_BANK0.gpio[26].write(|w| w.od().set_bit().ie().clear_bit().pue().clear_bit().pde().clear_bit());
+        adc.cs.modify(|r, w| w.bits(r.bits()).ainsel().bits(0));
         adc.fcs.write_with_zero(|w| w.en().set_bit());
-        adc.cs.write_with_zero(|w| w.start_many().set_bit());
+        adc.cs.modify(|r, w| w.bits(r.bits()).start_many().set_bit());
     }
 
-    let gpio26 = pins.gpio26.into_floating_input();
+    let mut measures = [0 as u8; BATCH_SIZE * 2];
 
     loop {
         usb_dev.poll(&mut [&mut bulk, &mut serial]);
 
-        let mut measures = [0 as u8; BATCH_SIZE * 2];
+        for _ in 0..16 {
+            for i in 0..BATCH_SIZE {
+                while adc.fcs.read().empty().bit() {}
+                let counts: u16 = adc.fifo.read().val().bits();
+                let first_byte_index = i * 2;
+                let second_byte_index = first_byte_index + 1;
 
-        for i in 0..BATCH_SIZE {
-            while adc.fcs.read().empty().bit() {}
-            let counts: u16 = adc.fifo.read().val().bits();
-            let first_byte_index = i * 2;
-            let second_byte_index = first_byte_index + 1;
+                measures[first_byte_index] = (counts >> 8).try_into().unwrap_or(255);
+                measures[second_byte_index] = (counts & 255).try_into().unwrap_or(255);
 
-            measures[first_byte_index] = (counts >> 8).try_into().unwrap_or(255);
-            measures[second_byte_index] = (counts & 255).try_into().unwrap_or(255);
-
+            }
             match bulk.write(&measures) {
                 Ok(_) => (),
                 Err(_) => {
-                    serial.write(b"ERROR");
+                    let _ = serial.write(b"ERROR");
                     ()
                 }
             };
