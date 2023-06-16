@@ -17,6 +17,7 @@ rp-pico = "0.7"
 usb-device = "0.2.9"
 usbd-serial = "0.1.1"
 heapless = "0.7.16"
+fugit = "0.3.7"
 
 # but you can use any BSP. Uncomment this to use the pro_micro_rp2040 BSP instead
 # sparkfun-pro-micro-rp2040 = "0.6"
