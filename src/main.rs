@@ -1,14 +1,11 @@
 #![no_std]
 #![no_main]
 
-use core::{borrow::BorrowMut, fmt::Write};
-
 use bsp::{
     entry,
     hal::{
         self,
         multicore::{Multicore, Stack},
-        sio::Spinlock0,
         timer::{Alarm, Alarm0},
         Timer,
     },
@@ -65,67 +62,7 @@ impl<'a, B: UsbBus> UsbClass<B> for BulkClass<'a, B> {
 }
 
 const BATCH_SIZE: usize = 32;
-const CIRCULAR_BUFFER_SIZE: usize = 128;
 static mut CORE1_STACK: Stack<1024> = Stack::new();
-
-struct ReadingsBuffer {
-    readings_buffer: [u16; CIRCULAR_BUFFER_SIZE],
-    readings_head: usize,
-    usb_head: usize,
-}
-
-impl ReadingsBuffer {
-    pub const fn new() -> Self {
-        Self {
-            readings_buffer: [0; CIRCULAR_BUFFER_SIZE],
-            readings_head: 0,
-            usb_head: 0,
-        }
-    }
-
-    pub fn can_send_batch(&self) -> bool {
-        let updated_readings_head = if self.readings_head < self.usb_head {
-            self.readings_head + CIRCULAR_BUFFER_SIZE
-        } else {
-            self.readings_head
-        };
-
-        updated_readings_head - self.usb_head >= BATCH_SIZE
-    }
-
-    pub fn can_read_adc(&self) -> bool {
-        let updated_usb_head = if self.usb_head < self.readings_head {
-            self.usb_head + CIRCULAR_BUFFER_SIZE
-        } else {
-            self.usb_head
-        };
-
-        updated_usb_head - self.readings_head > 1
-    }
-
-    pub fn push_adc_reading(&mut self, reading: u16) {
-        self.readings_buffer[self.readings_head] = reading;
-        self.readings_head += 1;
-        self.readings_head %= CIRCULAR_BUFFER_SIZE;
-    }
-
-    pub fn pop_readings(&mut self, measures: &mut [u8]) {
-        for i in 0..BATCH_SIZE {
-            let first_byte_index = i * 2;
-            let second_byte_index = first_byte_index + 1;
-
-            let counts = self.readings_buffer[(self.usb_head + i) % CIRCULAR_BUFFER_SIZE];
-
-            measures[first_byte_index] = (counts >> 8).try_into().unwrap_or(255);
-            measures[second_byte_index] = (counts & 255).try_into().unwrap_or(255);
-        }
-
-        self.usb_head += BATCH_SIZE;
-        self.usb_head %= CIRCULAR_BUFFER_SIZE;
-    }
-}
-
-static mut READINGS_BUFFER: ReadingsBuffer = ReadingsBuffer::new();
 
 static mut ALARM: Option<Alarm0> = None;
 static mut USB_ALLOCATOR: Option<UsbBusAllocator<hal::usb::UsbBus>> = None;
@@ -188,6 +125,7 @@ fn main() -> ! {
     );
 
     let mut timer = Timer::new(pac.TIMER, &mut resets);
+
     let mut mc = Multicore::new(&mut pac.PSM, &mut ppb, &mut sio.fifo);
     let alarm = timer.alarm_0().unwrap();
 
@@ -257,32 +195,43 @@ fn main() -> ! {
     let cores = mc.cores();
     let core1 = &mut cores[1];
 
-    let _readings_thread = core1.spawn(unsafe { &mut CORE1_STACK.mem }, move || loop {
-        while adc.fcs.read().empty().bit() {}
+    let _ = core1.spawn(unsafe { &mut CORE1_STACK.mem }, move || {
+        let pac = unsafe { pac::Peripherals::steal() };
+        let mut sio = hal::Sio::new(pac.SIO);
 
-        let _lock = Spinlock0::claim();
+        loop {
+            while adc.fcs.read().empty().bit() {}
+            let reading0 = adc.fifo.read().val().bits();
 
-        unsafe {
-            while READINGS_BUFFER.can_read_adc() && !adc.fcs.read().empty().bit() {
-                READINGS_BUFFER.push_adc_reading(adc.fifo.read().val().bits())
-            }
+            while adc.fcs.read().empty().bit() {}
+            let reading1 = adc.fifo.read().val().bits();
+
+            let data: u32 =
+                reading0.try_into().unwrap_or(0) << 16 | reading1.try_into().unwrap_or(0);
+            sio.fifo.write_blocking(data);
         }
     });
 
     let mut measures = [0u8; BATCH_SIZE * 2];
 
     loop {
-        let lock = Spinlock0::claim();
+        for i in 0..BATCH_SIZE / 2 {
+            let data = sio.fifo.read_blocking();
+            let reading0: u16 = (data >> 16).try_into().unwrap_or(0);
+            let reading1: u16 = (data & 0xffff).try_into().unwrap_or(0);
+
+            let begin = i * 4;
+            let end = begin + 4;
+
+            measures[begin..end].copy_from_slice(&[
+                (reading0 >> 8).try_into().unwrap_or(255),
+                (reading0 & 255).try_into().unwrap_or(255),
+                (reading1 >> 8).try_into().unwrap_or(255),
+                (reading1 & 255).try_into().unwrap_or(255),
+            ]);
+        }
 
         unsafe {
-            if !READINGS_BUFFER.can_send_batch() {
-                continue;
-            }
-
-            READINGS_BUFFER.pop_readings(&mut measures);
-
-            drop(lock);
-
             let _ = &USB_CLASS_LIST.as_mut().unwrap().1.write(&measures);
         }
     }
